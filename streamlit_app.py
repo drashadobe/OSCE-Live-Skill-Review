@@ -1,5 +1,3 @@
-pip install streamlit
-streamlit run streamlit_app.py
 # streamlit_app.py
 # Minimal single-file Streamlit conversion of your React OSCE app.
 # - No external AI required (summary is generated locally).
