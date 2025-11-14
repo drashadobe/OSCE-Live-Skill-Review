@@ -154,15 +154,16 @@ if not st.session_state.user_details:
         phone = st.text_input("Phone")
         designation = st.text_input("Designation")
         duration = st.number_input("Session duration (minutes)", min_value=1, max_value=180, value=10)
-        submitted = st.form_submit_button("Start session setup")
-        if submitted:
-            if not name:
-                st.warning("Please enter name.")
-            else:
-                st.session_state.user_details = UserDetails(name=name, phone=phone, designation=designation)
-                st.session_state.duration_seconds = int(duration * 60)
-                st.session_state.session_status = "idle"
-                st.experimental_rerun()
+            submitted = st.form_submit_button("Start session setup")
+    if submitted:
+        if not name:
+            st.warning("Please enter name.")
+        else:
+            st.session_state.user_details = UserDetails(name=name, phone=phone, designation=designation)
+            st.session_state.duration_seconds = int(duration * 60)
+            st.session_state.session_status = "idle"
+            st.success("Welcome saved — continuing.")
+
 
 # -------------------------
 # Main app after welcome
