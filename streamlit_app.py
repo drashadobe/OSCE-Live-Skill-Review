@@ -154,7 +154,7 @@ if not st.session_state.user_details:
         phone = st.text_input("Phone")
         designation = st.text_input("Designation")
         duration = st.number_input("Session duration (minutes)", min_value=1, max_value=180, value=10)
-            submitted = st.form_submit_button("Start session setup")
+            submitted = st.form_submit_button(Start session setup)
     if submitted:
         if not name:
             st.warning("Please enter name.")
