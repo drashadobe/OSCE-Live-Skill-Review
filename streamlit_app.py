@@ -434,7 +434,7 @@ Summary:`;
              // FIX: Use functional update to avoid race conditions with stale state.
              setSessionStatus((prevStatus) => {
                 if (prevStatus !== SessionStatus.ERROR && prevStatus !== SessionStatus.ENDED) {
-                    // If stopSession wasn't called by an error or button, save session state and transition to ENDED.
+                    // If stopSession was not called by an error or button, save session state and transition to ENDED.
                     try {
                         const sessionToSave = { transcript: transcriptRef.current, rubric: rubricRef.current };
                         localStorage.setItem('osce_saved_session', JSON.stringify(sessionToSave));
