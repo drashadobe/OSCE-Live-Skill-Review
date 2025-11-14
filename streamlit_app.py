@@ -513,7 +513,10 @@ Summary:`;
 
     const formatRubricForEmail = (rubricItems: RubricItem[]) => {
         return rubricItems
-            .map(item => `• ${item.skill}: ${item.status.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())}`)
+            js_code = """
+.map(item => `• ${item.skill}: ${item.status.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())}`)
+"""
+
             .join('\n');
     };
 
