@@ -1,0 +1,8 @@
+{
+  "name": "OSCE Live Skill Review",
+  "description": "An AI-powered application to provide real-time feedback on OSCE clinical skills via live video and audio streaming, acting as a virtual examiner.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
