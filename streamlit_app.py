@@ -168,7 +168,7 @@ Summary:`;
   }, [addToTranscript]);
 
   useEffect(() => {
-    // Cleanup on unmount, don't generate summary
+    // Cleanup on unmount, do not generate summary
     return () => {
       stopSession();
     };
