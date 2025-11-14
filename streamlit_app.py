@@ -134,7 +134,7 @@ const App: React.FC = () => {
           .map(item => `- ${item.skill}: ${item.status.replace('_', ' ')}`)
           .join('\n');
 
-        const prompt = `You are an AI clinical examiner summarizing an OSCE session.
+        const prompt = `You are an AI clinical examiner summarizing an OSCE session.'
 Based on the following transcript and final rubric checklist, provide a concise summary of the student's performance.
 Address the student directly. Highlight areas of strength and suggest specific areas for improvement.
 Keep the summary to 2-3 paragraphs.
