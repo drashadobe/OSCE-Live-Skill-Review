@@ -1,662 +1,338 @@
+pip install streamlit
+streamlit run streamlit_app.py
+# streamlit_app.py
+# Minimal single-file Streamlit conversion of your React OSCE app.
+# - No external AI required (summary is generated locally).
+# - Uses st.camera_input for snapshots (browser permission needed).
+# - Saves/resumes sessions via JSON upload/download.
 
-import React, { useState, useRef, useCallback, useEffect } from 'react';
-// FIX: The 'LiveSession' type is not exported from the '@google/genai' package. It has been removed.
-import { GoogleGenAI, LiveServerMessage, Modality, Blob, FunctionDeclaration, Type } from '@google/genai';
-import VideoPlayer from './components/VideoPlayer';
-import FeedbackPanel from './components/FeedbackPanel';
-import RubricPanel from './components/RubricPanel';
-import InstructionsPanel from './components/InstructionsPanel';
-import ConfirmationDialog from './components/ConfirmationDialog';
-import ResumeDialog from './components/ResumeDialog';
-import WelcomeForm from './components/WelcomeForm';
-import Timer from './components/Timer';
-import { SessionStatus, type TranscriptEntry, type RubricItem, RubricStatus, INITIAL_RUBRIC, type RubricSuggestion, type UserDetails } from './types';
-import { encode, decode, decodeAudioData } from './utils/audioUtils';
+import streamlit as st
+from dataclasses import dataclass, asdict
+from typing import List, Optional, Dict, Any
+import time
+import json
+import urllib.parse
 
-// Constants
-const INPUT_SAMPLE_RATE = 16000;
-const OUTPUT_SAMPLE_RATE = 24000;
-const FRAME_RATE = 2; // fps for video stream
-const JPEG_QUALITY = 0.7;
+# -------------------------
+# Data models / constants
+# -------------------------
 
-const App: React.FC = () => {
-  const [sessionStatus, setSessionStatus] = useState<SessionStatus>(SessionStatus.IDLE);
-  const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
-  // FIX: Corrected a typo in the constant name from `INITIAL_RUBric` to `INITIAL_RUBRIC`.
-  const [rubric, setRubric] = useState<RubricItem[]>(INITIAL_RUBRIC);
-  const [showConfirmation, setShowConfirmation] = useState<boolean>(false);
-  const [showEmailDialog, setShowEmailDialog] = useState<boolean>(false);
-  const [suggestedUpdate, setSuggestedUpdate] = useState<RubricSuggestion | null>(null);
-  const [savedSessionData, setSavedSessionData] = useState<{ transcript: TranscriptEntry[], rubric: RubricItem[] } | null>(null);
-  const [isCheckingForSession, setIsCheckingForSession] = useState<boolean>(true);
-  const [isUserDetailsSubmitted, setIsUserDetailsSubmitted] = useState<boolean>(false);
-  const [userDetails, setUserDetails] = useState<UserDetails | null>(null);
-  const [sessionStartTime, setSessionStartTime] = useState<number | null>(null);
-  const [sessionDuration, setSessionDuration] = useState<number | null>(null); // in seconds
-  const [summaryText, setSummaryText] = useState<string | null>(null);
+class RubricStatus:
+    PENDING = "pending"
+    MET = "met"
+    NOT_MET = "not_met"
 
-  
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  // FIX: The `LiveSession` type is not exported by the `@google/genai` package.
-  // Replaced it with an inferred type using `ReturnType` on `GoogleGenAI['live']['connect']`
-  // to correctly type the session promise ref.
-  const sessionPromiseRef = useRef<ReturnType<GoogleGenAI['live']['connect']> | null>(null);
-  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
-  const mediaStreamSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const frameIntervalRef = useRef<number | null>(null);
+@dataclass
+class RubricItem:
+    id: str
+    skill: str
+    status: str = RubricStatus.PENDING
 
-  // Audio playback refs
-  const outputAudioContextRef = useRef<AudioContext | null>(null);
-  const nextStartTimeRef = useRef<number>(0);
-  const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+@dataclass
+class TranscriptEntry:
+    speaker: str  # 'user' | 'ai' | 'system' | 'summary'
+    text: str
+    ts: float
 
-  // Transcription refs
-  const currentInputTranscriptionRef = useRef('');
-  const currentOutputTranscriptionRef = useRef('');
-  
-  const aiRef = useRef<GoogleGenAI | null>(null);
-  const hasSuggestionRef = useRef(false);
+@dataclass
+class UserDetails:
+    name: str
+    phone: str
+    designation: str
 
-  // Refs to hold latest state for use in callbacks with stale closures
-  const transcriptRef = useRef(transcript);
-  useEffect(() => { transcriptRef.current = transcript; }, [transcript]);
-  const rubricRef = useRef(rubric);
-  useEffect(() => { rubricRef.current = rubric; }, [rubric]);
+# Example initial rubric — edit as needed
+INITIAL_RUBRIC: List[RubricItem] = [
+    RubricItem(id="hand_hygiene", skill="Hand hygiene"),
+    RubricItem(id="introduce_self", skill="Introduces self to patient"),
+    RubricItem(id="explain_procedure", skill="Explains procedure"),
+    RubricItem(id="obtain_consent", skill="Obtains consent"),
+    RubricItem(id="maintain_privacy", skill="Maintains privacy and dignity"),
+]
 
-  useEffect(() => {
-    try {
-      const savedDataString = localStorage.getItem('osce_saved_session');
-      if (savedDataString) {
-        const savedData = JSON.parse(savedDataString);
-        if (savedData.transcript && savedData.rubric) {
-          setSavedSessionData(savedData);
-        }
-      }
-    } catch (error) {
-      console.error("Failed to load session from localStorage", error);
-      localStorage.removeItem('osce_saved_session');
+# -------------------------
+# Utility functions
+# -------------------------
+
+def now_ts() -> float:
+    return time.time()
+
+def save_session_to_bytes(session: Dict[str, Any]) -> bytes:
+    return json.dumps(session, ensure_ascii=False, indent=2).encode("utf-8")
+
+def load_session_from_bytes(b: bytes) -> Dict[str, Any]:
+    return json.loads(b.decode("utf-8"))
+
+def format_rubric_for_email(rubric: List[RubricItem]) -> str:
+    return "\n".join(f"- {ri.skill}: {ri.status.replace('_', ' ').title()}" for ri in rubric)
+
+def format_transcript_for_email(transcript: List[TranscriptEntry]) -> str:
+    def who(e: TranscriptEntry):
+        return "Student" if e.speaker == "user" else ("Examiner" if e.speaker == "ai" else e.speaker.capitalize())
+    return "\n\n".join(f"{who(e)}: {e.text}" for e in transcript if e.speaker in ("user", "ai"))
+
+def generate_local_summary(transcript: List[TranscriptEntry], rubric: List[RubricItem]) -> str:
+    # Simple deterministic summary (no external API). You can later call your AI here.
+    strengths = [r.skill for r in rubric if r.status == RubricStatus.MET]
+    needs = [r.skill for r in rubric if r.status == RubricStatus.NOT_MET]
+
+    # pick last few transcript lines from student to quote context
+    student_lines = [t.text for t in transcript if t.speaker == "user"]
+    recent = student_lines[-3:] if len(student_lines) >= 1 else []
+
+    lines = []
+    lines.append(f"Dear {st.session_state['user_details'].name if 'user_details' in st.session_state and st.session_state['user_details'] else 'Student'},")
+    if strengths:
+        lines.append("Strengths: " + ", ".join(strengths) + ".")
+    if needs:
+        lines.append("Areas for improvement: " + ", ".join(needs) + ".")
+    if recent:
+        lines.append("Notes from the session: " + " / ".join(recent))
+    lines.append("Suggestions: Practice the identified areas; follow checklist steps clearly during the examination.")
+    return "\n\n".join(lines)
+
+# -------------------------
+# Session state helpers
+# -------------------------
+
+if "initialized" not in st.session_state:
+    st.session_state.initialized = True
+    st.session_state.session_status = "idle"  # idle | connecting | live | ended | error
+    st.session_state.transcript: List[TranscriptEntry] = []
+    st.session_state.rubric: List[RubricItem] = [RubricItem(**asdict(i)) for i in INITIAL_RUBRIC]
+    st.session_state.suggested_update: Optional[Dict[str, Any]] = None
+    st.session_state.saved_session: Optional[Dict[str, Any]] = None
+    st.session_state.start_time: Optional[float] = None
+    st.session_state.duration_seconds: Optional[int] = None
+    st.session_state.user_details: Optional[UserDetails] = None
+    st.session_state.summary_text: Optional[str] = None
+
+# -------------------------
+# UI: sidebar for load/save and session info
+# -------------------------
+st.set_page_config(page_title="OSCE Live Skill Review", layout="wide")
+st.sidebar.header("Session Controls")
+
+uploaded = st.sidebar.file_uploader("Load saved session JSON", type=["json"])
+if uploaded:
+    try:
+        data = load_session_from_bytes(uploaded.read())
+        # basic restore
+        st.session_state.transcript = [TranscriptEntry(**t) for t in data.get("transcript", [])]
+        st.session_state.rubric = [RubricItem(**r) for r in data.get("rubric", [])]
+        ud = data.get("user_details")
+        if ud:
+            st.session_state.user_details = UserDetails(**ud)
+        st.success("Session loaded from file.")
+        st.session_state.session_status = "ended"
+    except Exception as e:
+        st.error(f"Failed to load session: {e}")
+
+if st.sidebar.button("Download session JSON"):
+    session_dump = {
+        "user_details": asdict(st.session_state.user_details) if st.session_state.user_details else None,
+        "transcript": [asdict(t) for t in st.session_state.transcript],
+        "rubric": [asdict(r) for r in st.session_state.rubric],
+        "summary": st.session_state.summary_text,
     }
-    setIsCheckingForSession(false);
-  }, []);
+    st.sidebar.download_button("Download JSON", data=save_session_to_bytes(session_dump), file_name="osce_session.json")
 
-  const addToTranscript = useCallback((entry: TranscriptEntry) => {
-    setTranscript(prev => [...prev, entry]);
-  }, []);
+if st.sidebar.button("Clear saved session in memory"):
+    st.session_state.saved_session = None
+    st.success("Cleared.")
 
-  // FIX: Refactored stopSession to only handle cleanup and summary generation.
-  // Status updates are now handled by the callers to prevent race conditions and stale state issues.
-  // This resolves the TypeScript error on line 84.
-  const stopSession = useCallback(async (currentTranscript?: TranscriptEntry[], finalRubric?: RubricItem[]) => {
-    setSessionStartTime(null);
-    // --- Stop all media streams and connections ---
-    if (frameIntervalRef.current) {
-      clearInterval(frameIntervalRef.current);
-      frameIntervalRef.current = null;
-    }
-    if (scriptProcessorRef.current) {
-        scriptProcessorRef.current.disconnect();
-        scriptProcessorRef.current = null;
-    }
-    if (mediaStreamSourceRef.current) {
-        mediaStreamSourceRef.current.disconnect();
-        mediaStreamSourceRef.current = null;
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
-      streamRef.current = null;
-    }
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
-    sessionPromiseRef.current?.then(session => session.close());
-    sessionPromiseRef.current = null;
-    for (const source of sourcesRef.current.values()) {
-        source.stop();
-    }
-    sourcesRef.current.clear();
-    nextStartTimeRef.current = 0;
-    setSuggestedUpdate(null);
-    hasSuggestionRef.current = false;
+st.sidebar.markdown("---")
+st.sidebar.write("Session status:", st.session_state.session_status)
+if st.session_state.start_time:
+    elapsed = int(now_ts() - st.session_state.start_time)
+    st.sidebar.write("Elapsed (s):", elapsed)
 
+# -------------------------
+# Welcome form / User details
+# -------------------------
+if not st.session_state.user_details:
+    st.title("OSCE Live Skill Review — Welcome")
+    with st.form("welcome_form"):
+        name = st.text_input("Name")
+        phone = st.text_input("Phone")
+        designation = st.text_input("Designation")
+        duration = st.number_input("Session duration (minutes)", min_value=1, max_value=180, value=10)
+        submitted = st.form_submit_button("Start session setup")
+        if submitted:
+            if not name:
+                st.warning("Please enter name.")
+            else:
+                st.session_state.user_details = UserDetails(name=name, phone=phone, designation=designation)
+                st.session_state.duration_seconds = int(duration * 60)
+                st.session_state.session_status = "idle"
+                st.experimental_rerun()
 
-    // --- Generate summary if transcript and rubric are provided ---
-    if (aiRef.current && currentTranscript && finalRubric) {
-      addToTranscript({ speaker: 'system', text: 'Session ended. Generating feedback summary...' });
-      try {
-        const formattedTranscript = currentTranscript
-          .filter(entry => entry.speaker === 'user' || entry.speaker === 'ai')
-          .map(entry => `${entry.speaker === 'user' ? 'Student' : 'Examiner'}: ${entry.text}`)
-          .join('\n');
-          
-        const formattedRubric = finalRubric
-          .map(item => `- ${item.skill}: ${item.status.replace('_', ' ')}`)
-          .join('\n');
+# -------------------------
+# Main app after welcome
+# -------------------------
+else:
+    header_col, timer_col, action_col = st.columns([3,1,2])
+    with header_col:
+        st.title("OSCE Live Skill Review")
+        st.write("AI-powered clinical skills examiner — local mode (no external AI).")
+        st.write(f"Participant: **{st.session_state.user_details.name}** | {st.session_state.user_details.designation} | {st.session_state.user_details.phone}")
 
-        const prompt = `You are an AI clinical examiner summarizing an OSCE session.
-Based on the following transcript and final rubric checklist, provide a concise summary of the student performance.
-Address the student directly. Highlight areas of strength and suggest specific areas for improvement.
-Keep the summary to 2-3 paragraphs.
+    with timer_col:
+        if st.session_state.start_time and st.session_state.session_status == "live":
+            elapsed = int(now_ts() - st.session_state.start_time)
+        elif st.session_state.start_time:
+            elapsed = int(now_ts() - st.session_state.start_time)
+        else:
+            elapsed = 0
+        mins, secs = divmod(elapsed, 60)
+        st.metric("Elapsed", f"{mins:02d}:{secs:02d}")
 
-Transcript:
-${formattedTranscript}
+    with action_col:
+        if st.session_state.session_status != "live":
+            if st.button("Start New Session"):
+                st.session_state.transcript = []
+                st.session_state.rubric = [RubricItem(**asdict(i)) for i in INITIAL_RUBRIC]
+                st.session_state.suggested_update = None
+                st.session_state.summary_text = None
+                st.session_state.start_time = now_ts()
+                st.session_state.session_status = "live"
+                st.experimental_rerun()
+        else:
+            if st.button("End Session"):
+                st.session_state.session_status = "ended"
+                st.session_state.summary_text = generate_local_summary(st.session_state.transcript, st.session_state.rubric)
+                st.success("Session ended. Summary created.")
 
-Rubric:
-${formattedRubric}
+    st.markdown("---")
 
-Summary:`;
-        
-        const response = await aiRef.current.models.generateContent({
-          model: 'gemini-2.5-flash',
-          contents: prompt,
-        });
-        
-        const summary = response.text;
-        addToTranscript({ speaker: 'summary', text: summary });
-        setSummaryText(summary);
+    # -------------------------
+    # Left column: Video / Camera + transcript input
+    # -------------------------
+    left, right = st.columns([2,1])
+    with left:
+        st.subheader("Live View / Snapshots")
+        camera_file = st.camera_input("Use camera to capture snapshots (click Capture)")
+        if camera_file:
+            # Save a note in transcript when a snapshot is taken
+            t = TranscriptEntry(speaker="system", text=f"Snapshot captured (size {camera_file.size} bytes)", ts=now_ts())
+            st.session_state.transcript.append(t)
+            st.success("Snapshot saved to transcript.")
 
+        st.subheader("Transcript")
+        # Display transcript entries
+        for entry in st.session_state.transcript:
+            who = "Student" if entry.speaker == "user" else ("Examiner" if entry.speaker == "ai" else entry.speaker.capitalize())
+            st.write(f"**{who}**: {entry.text}")
 
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "An unknown error occurred.";
-        console.error('Failed to generate summary:', error);
-        addToTranscript({ speaker: 'system', text: `Could not generate summary: ${message}` });
-      }
-    } else {
-       addToTranscript({ speaker: 'system', text: 'Session ended.' });
-    }
-  }, [addToTranscript]);
+        with st.form("add_transcript"):
+            col1, col2 = st.columns([2,6])
+            speaker = col1.selectbox("Speaker", ["user", "ai"])
+            text = col2.text_input("Transcript text")
+            if st.form_submit_button("Add to transcript"):
+                if text.strip():
+                    st.session_state.transcript.append(TranscriptEntry(speaker=speaker, text=text.strip(), ts=now_ts()))
+                    st.success("Added.")
+                    st.experimental_rerun()
 
-  useEffect(() => {
-    // Cleanup on unmount, do not generate summary
-    return () => {
-      stopSession();
-    };
-  }, [stopSession]);
+    # -------------------------
+    # Right column: Rubric, suggestions, summary
+    # -------------------------
+    with right:
+        st.subheader("Rubric")
+        # show rubric table with selectboxes
+        for idx, item in enumerate(st.session_state.rubric):
+            cols = st.columns([3,2])
+            cols[0].write(f"**{item.skill}**")
+            new_status = cols[1].selectbox(
+                "Status",
+                options=[RubricStatus.PENDING, RubricStatus.MET, RubricStatus.NOT_MET],
+                index=[RubricStatus.PENDING, RubricStatus.MET, RubricStatus.NOT_MET].index(item.status),
+                key=f"rubric_{item.id}"
+            )
+            # update back into state
+            st.session_state.rubric[idx].status = new_status
 
-  const handleUpdateRubric = useCallback((skillId: string, newStatus: RubricStatus) => {
-    setRubric(prevRubric =>
-      prevRubric.map(item =>
-        item.id === skillId ? { ...item, status: newStatus } : item
-      )
-    );
-  }, []);
+        st.markdown("---")
+        st.subheader("Suggestions")
+        # Simple simulation: allow user to add suggestion (this replaces your AI toolcall flow)
+        with st.form("suggestion_form"):
+            skill_choice = st.selectbox("Skill to suggest update for", options=[r.id for r in st.session_state.rubric])
+            status_choice = st.selectbox("Suggested status", options=[RubricStatus.MET, RubricStatus.NOT_MET])
+            reasoning = st.text_input("Reasoning for suggestion")
+            if st.form_submit_button("Propose suggestion"):
+                st.session_state.suggested_update = {"skillId": skill_choice, "status": status_choice, "reasoning": reasoning}
+                st.success("Suggestion created. Await user confirmation.")
 
-  const handleSuggestion = useCallback((accepted: boolean, suggestion: RubricSuggestion | null) => {
-    if (!suggestion) return;
+        if st.session_state.suggested_update:
+            su = st.session_state.suggested_update
+            st.write(f"Suggestion: set **{su['skillId']}** → **{su['status']}**")
+            st.write(f"Reason: {su['reasoning'] or '-'}")
+            col_a, col_b = st.columns(2)
+            if col_a.button("Accept suggestion"):
+                # apply suggestion
+                for r in st.session_state.rubric:
+                    if r.id == su["skillId"]:
+                        r.status = su["status"]
+                st.session_state.transcript.append(TranscriptEntry(speaker="system", text=f"Suggestion accepted for {su['skillId']}", ts=now_ts()))
+                st.session_state.suggested_update = None
+                st.success("Suggestion accepted.")
+                st.experimental_rerun()
+            if col_b.button("Reject suggestion"):
+                st.session_state.transcript.append(TranscriptEntry(speaker="system", text=f"Suggestion rejected for {su['skillId']}", ts=now_ts()))
+                st.session_state.suggested_update = None
+                st.success("Suggestion rejected.")
+                st.experimental_rerun()
 
-    if (accepted) {
-      handleUpdateRubric(suggestion.skillId, suggestion.status);
-    }
-    
-    setSuggestedUpdate(null);
-    hasSuggestionRef.current = false;
-
-    sessionPromiseRef.current?.then(session => {
-      session.sendToolResponse({
-        functionResponses: {
-          id: suggestion.toolCallId,
-          name: 'suggestRubricUpdate',
-          response: { result: `User has ${accepted ? 'accepted' : 'rejected'} the suggestion for ${suggestion.skillId}.` },
-        }
-      })
-    });
-  }, [handleUpdateRubric]);
-
-  const handleConfirmEndSession = useCallback(() => {
-    setShowConfirmation(false);
-    // Save state on successful completion using refs to avoid stale state
-    try {
-        const sessionToSave = { transcript: transcriptRef.current, rubric: rubricRef.current };
-        localStorage.setItem('osce_saved_session', JSON.stringify(sessionToSave));
-    } catch (error) {
-        console.error("Failed to save session to localStorage", error);
-    }
-    stopSession(transcriptRef.current, rubricRef.current);
-    setSessionStatus(SessionStatus.ENDED);
-  }, [stopSession]);
-
-  const handleTimeUp = useCallback(() => {
-    addToTranscript({ speaker: 'system', text: 'Time is up. Automatically ending session.' });
-    // This will trigger the summary generation and cleanup
-    handleConfirmEndSession();
-  }, [addToTranscript, handleConfirmEndSession]);
-  
-
-  const handleStartSession = useCallback(async () => {
-    localStorage.removeItem('osce_saved_session');
-    if (sessionStatus !== SessionStatus.IDLE && sessionStatus !== SessionStatus.ENDED && sessionStatus !== SessionStatus.ERROR) return;
-
-    setTranscript([]);
-    setRubric(INITIAL_RUBRIC.map(item => ({ ...item, status: RubricStatus.PENDING })));
-    setSuggestedUpdate(null);
-    hasSuggestionRef.current = false;
-    setSessionStartTime(null);
-    setSummaryText(null);
-    addToTranscript({speaker: 'system', text: 'Initializing session...'});
-    setSessionStatus(SessionStatus.CONNECTING);
-    
-    try {
-      if (!process.env.API_KEY) {
-        throw new Error("API_KEY environment variable not set.");
-      }
-      aiRef.current = new GoogleGenAI({ apiKey: process.env.API_KEY });
-      
-      const supportedConstraints = navigator.mediaDevices.getSupportedConstraints();
-      const audioConstraints: MediaTrackConstraints = {};
-      const enabledEnhancements: string[] = [];
-
-      if (supportedConstraints.noiseSuppression) {
-        audioConstraints.noiseSuppression = true;
-        enabledEnhancements.push('noise suppression');
-      }
-      if (supportedConstraints.echoCancellation) {
-        audioConstraints.echoCancellation = true;
-        enabledEnhancements.push('echo cancellation');
-      }
-
-      streamRef.current = await navigator.mediaDevices.getUserMedia({ 
-        audio: Object.keys(audioConstraints).length > 0 ? audioConstraints : true, 
-        video: true 
-      });
-
-      if (enabledEnhancements.length > 0) {
-        addToTranscript({ speaker: 'system', text: `Audio enhancements enabled: ${enabledEnhancements.join(', ')}.`});
-      }
-
-      if (videoRef.current) {
-        videoRef.current.srcObject = streamRef.current;
-      }
-
-      // Initialize audio contexts
-      const inputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: INPUT_SAMPLE_RATE });
-      outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: OUTPUT_SAMPLE_RATE });
-      
-      const onMessage = async (message: LiveServerMessage) => {
-        // Handle audio output
-        const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
-        if (base64Audio && outputAudioContextRef.current) {
-          nextStartTimeRef.current = Math.max(nextStartTimeRef.current, outputAudioContextRef.current.currentTime);
-          const audioBuffer = await decodeAudioData(decode(base64Audio), outputAudioContextRef.current, OUTPUT_SAMPLE_RATE, 1);
-          const source = outputAudioContextRef.current.createBufferSource();
-          source.buffer = audioBuffer;
-          source.connect(outputAudioContextRef.current.destination);
-          source.addEventListener('ended', () => sourcesRef.current.delete(source));
-          source.start(nextStartTimeRef.current);
-          nextStartTimeRef.current += audioBuffer.duration;
-          sourcesRef.current.add(source);
-        }
-
-        // Handle tool calls for rubric
-        if (message.toolCall) {
-          for (const fc of message.toolCall.functionCalls) {
-              if (fc.name === 'suggestRubricUpdate') {
-                  const { skillId, status, reasoning } = fc.args as { skillId: string; status: RubricStatus; reasoning: string };
-                  if (hasSuggestionRef.current) {
-                      sessionPromiseRef.current?.then(session => {
-                          session.sendToolResponse({
-                              functionResponses: {
-                                  id : fc.id,
-                                  name: fc.name,
-                                  response: { result: `Suggestion for ${skillId} ignored as another suggestion is pending.` },
-                              }
-                          });
-                      });
-                  } else {
-                      hasSuggestionRef.current = true;
-                      setSuggestedUpdate({
-                          skillId,
-                          status,
-                          reasoning,
-                          toolCallId: fc.id,
-                      });
-                  }
-              }
-          }
-        }
-
-        // Handle transcription
-        if (message.serverContent?.outputTranscription) {
-            currentOutputTranscriptionRef.current += message.serverContent.outputTranscription.text;
-        }
-        if (message.serverContent?.inputTranscription) {
-            currentInputTranscriptionRef.current += message.serverContent.inputTranscription.text;
-        }
-
-        if (message.serverContent?.turnComplete) {
-            if (currentInputTranscriptionRef.current.trim()) {
-                addToTranscript({ speaker: 'user', text: currentInputTranscriptionRef.current.trim() });
-            }
-            if (currentOutputTranscriptionRef.current.trim()) {
-                addToTranscript({ speaker: 'ai', text: currentOutputTranscriptionRef.current.trim() });
-            }
-            currentInputTranscriptionRef.current = '';
-            currentOutputTranscriptionRef.current = '';
-        }
-
-        if (message.serverContent?.interrupted) {
-            for (const source of sourcesRef.current.values()) {
-              source.stop();
-              sourcesRef.current.delete(source);
-            }
-            nextStartTimeRef.current = 0;
-        }
-      };
-
-      const suggestRubricUpdateFunction: FunctionDeclaration = {
-          name: 'suggestRubricUpdate',
-          description: 'Suggests an update to the status of a specific skill in the OSCE checklist based on an observation. Await user confirmation before proceeding.',
-          parameters: {
-              type: Type.OBJECT,
-              properties: {
-                  skillId: {
-                      type: Type.STRING,
-                      description: `The unique ID of the skill to update. Available IDs: ${INITIAL_RUBRIC.map(i => i.id).join(', ')}.`,
-                  },
-                  status: {
-                      type: Type.STRING,
-                      description: `The new status to suggest for the skill. Must be one of: '${RubricStatus.MET}' or '${RubricStatus.NOT_MET}'.`,
-                      enum: [RubricStatus.MET, RubricStatus.NOT_MET],
-                  },
-                   reasoning: {
-                        type: Type.STRING,
-                        description: 'A brief explanation for why this update is being suggested. E.g., "The student washed their hands before touching the patient."'
-                    }
-              },
-              required: ['skillId', 'status', 'reasoning'],
-          },
-      };
-
-      sessionPromiseRef.current = aiRef.current.live.connect({
-        model: 'gemini-2.5-flash-native-audio-preview-09-2025',
-        callbacks: {
-          onopen: () => {
-            setSessionStatus(SessionStatus.LIVE);
-            setSessionStartTime(Date.now());
-            addToTranscript({speaker: 'system', text: 'Connection established. You may begin.'});
-            
-            mediaStreamSourceRef.current = inputAudioContext.createMediaStreamSource(streamRef.current!);
-            scriptProcessorRef.current = inputAudioContext.createScriptProcessor(4096, 1, 1);
-            
-            scriptProcessorRef.current.onaudioprocess = (event) => {
-              const inputData = event.inputBuffer.getChannelData(0);
-              const pcmBlob: Blob = {
-                data: encode(new Uint8Array(new Int16Array(inputData.map(x => x * 32768)).buffer)),
-                mimeType: `audio/pcm;rate=${INPUT_SAMPLE_RATE}`,
-              };
-              sessionPromiseRef.current?.then(session => session.sendRealtimeInput({ media: pcmBlob }));
-            };
-
-            mediaStreamSourceRef.current.connect(scriptProcessorRef.current);
-            scriptProcessorRef.current.connect(inputAudioContext.destination);
-
-            frameIntervalRef.current = window.setInterval(() => {
-              const video = videoRef.current;
-              const canvas = canvasRef.current;
-              if (video && canvas && video.readyState >= 2) {
-                const ctx = canvas.getContext('2d');
-                if (!ctx) return;
-                canvas.width = video.videoWidth;
-                canvas.height = video.videoHeight;
-                ctx.drawImage(video, 0, 0, video.videoWidth, video.videoHeight);
-                canvas.toBlob(async (blob) => {
-                  if (blob) {
-                    const reader = new FileReader();
-                    reader.onload = () => {
-                      const base64Data = (reader.result as string).split(',')[1];
-                      sessionPromiseRef.current?.then(session => session.sendRealtimeInput({
-                        media: { data: base64Data, mimeType: 'image/jpeg' }
-                      }));
-                    };
-                    reader.readAsDataURL(blob);
-                  }
-                }, 'image/jpeg', JPEG_QUALITY);
-              }
-            }, 1000 / FRAME_RATE);
-
-          },
-          onmessage: onMessage,
-          onerror: (e: ErrorEvent) => {
-            console.error('Session error:', e);
-            addToTranscript({ speaker: 'system', text: `An error occurred: ${e.message}` });
-            setSessionStatus(SessionStatus.ERROR);
-            stopSession();
-             // Save state on error
-            try {
-                const sessionToSave = { transcript: transcriptRef.current, rubric: rubricRef.current };
-                localStorage.setItem('osce_saved_session', JSON.stringify(sessionToSave));
-            } catch (saveError) {
-                console.error("Failed to save session on error", saveError);
-            }
-          },
-          onclose: (e: CloseEvent) => {
-             console.log('Session closed');
-             // FIX: Use functional update to avoid race conditions with stale state.
-             setSessionStatus((prevStatus) => {
-                if (prevStatus !== SessionStatus.ERROR && prevStatus !== SessionStatus.ENDED) {
-                    // If stopSession was not called by an error or button, save session state and transition to ENDED.
-                    try {
-                        const sessionToSave = { transcript: transcriptRef.current, rubric: rubricRef.current };
-                        localStorage.setItem('osce_saved_session', JSON.stringify(sessionToSave));
-                    } catch (saveError) {
-                        console.error("Failed to save session on close", saveError);
-                    }
-                    addToTranscript({ speaker: 'system', text: 'Session closed by server.' });
-                    return SessionStatus.ENDED;
-                }
-                return prevStatus;
-             });
-          },
-        },
-        config: {
-          responseModalities: [Modality.AUDIO],
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
-          tools: [{ functionDeclarations: [suggestRubricUpdateFunction] }],
-          systemInstruction: `You are an AI clinical examiner for an OSCE (Objective Structured Clinical Examination). Your role is to observe a medical student performing a clinical skill via live video and audio.
-- Observe the actions of student and words carefully.
-- Based on their performance, you MUST call the 'suggestRubricUpdate' function to suggest a checklist update. Provide a clear reason for your suggestion. Do not update the checklist directly; you must await user confirmation.
-- For each item in the checklist, call the function with the appropriate 'skillId', 'status' ('met' or 'not_met'), and a concise 'reasoning'.
-- Provide verbal feedback and guidance to the student as if you were a real examiner in the room. Be encouraging but professional.
-- Address the student directly.
-- Do not suggest evaluating all criteria at once. Suggest an update as you observe the actions. For example, when you see them wash their hands, immediately call the function to suggest updating 'hand_hygiene' to 'met'.`
-        },
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "An unknown error occurred.";
-      console.error('Failed to start session:', error);
-      addToTranscript({ speaker: 'system', text: `Failed to start session: ${message}` });
-      setSessionStatus(SessionStatus.ERROR);
-    }
-  }, [sessionStatus, addToTranscript, stopSession, handleUpdateRubric]);
-
-  const handleMainButtonClick = () => {
-    if (sessionStatus === SessionStatus.LIVE) {
-      setShowConfirmation(true);
-    } else {
-      handleStartSession();
-    }
-  };
-
-  const handleResumeSession = () => {
-    if (savedSessionData) {
-      setTranscript(savedSessionData.transcript);
-      setRubric(savedSessionData.rubric);
-      // Manually add summary if it exists, for email functionality
-      const summaryEntry = savedSessionData.transcript.find(e => e.speaker === 'summary');
-      if (summaryEntry) {
-          setSummaryText(summaryEntry.text);
-      }
-      setSessionStatus(SessionStatus.ENDED); // Set to ended so they can review
-      setSavedSessionData(null);
-      localStorage.removeItem('osce_saved_session');
-    }
-  };
-
-  const handleStartNewSessionFresh = () => {
-    localStorage.removeItem('osce_saved_session');
-    setSavedSessionData(null);
-  };
-
-  const handleUserDetailsSubmit = (details: UserDetails, durationInMinutes: number) => {
-    setUserDetails(details);
-    setSessionDuration(durationInMinutes * 60); // Convert minutes to seconds
-    setIsUserDetailsSubmitted(true);
-  };
-  
-  const handleConfirmSendEmail = useCallback(() => {
-    setShowEmailDialog(false);
-    if (!userDetails || !summaryText) {
-        alert("Cannot send email: User details or summary is missing.");
-        return;
-    }
-
-    const formatRubricForEmail = (rubricItems: RubricItem[]) => {
-        return rubricItems
-            js_code = """
-.map(item => `• ${item.skill}: ${item.status.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())}`)
-"""
-
-            .join('\n');
-    };
-
-    const formatTranscriptForEmail = (transcriptEntries: TranscriptEntry[]) => {
-        return transcriptEntries
-            .filter(entry => entry.speaker === 'user' || entry.speaker === 'ai')
-            .map(entry => `${entry.speaker === 'user' ? 'Student' : 'Examiner'}: ${entry.text}`)
-            .join('\n\n');
-    };
-
-    const subject = `OSCE Skill Review Report for ${userDetails.name}`;
-    const body = `Dear ${userDetails.name},
-
-Here is the report for your recent OSCE skill review session.
+        st.markdown("---")
+        st.subheader("Session Summary")
+        if st.session_state.session_status == "ended":
+            if st.session_state.summary_text is None:
+                st.session_state.summary_text = generate_local_summary(st.session_state.transcript, st.session_state.rubric)
+            st.text_area("Summary", value=st.session_state.summary_text, height=200)
+            # Email button via mailto
+            subject = f"OSCE Skill Review Report for {st.session_state.user_details.name}"
+            body = f"""Dear {st.session_state.user_details.name},
 
 --- FEEDBACK SUMMARY ---
-${summaryText}
+{st.session_state.summary_text}
 
 --- FINAL RUBRIC CHECKLIST ---
-${formatRubricForEmail(rubric)}
+{format_rubric_for_email(st.session_state.rubric)}
 
 --- SESSION DETAILS ---
-Name: ${userDetails.name}
-Phone: ${userDetails.phone}
-Designation: ${userDetails.designation}
+Name: {st.session_state.user_details.name}
+Phone: {st.session_state.user_details.phone}
+Designation: {st.session_state.user_details.designation}
 
 --- FULL TRANSCRIPT ---
-${formatTranscriptForEmail(transcript)}
+{format_transcript_for_email(st.session_state.transcript)}
 
 Best regards,
 The AI Clinical Examiner
-    `;
+"""
+            mailto = "mailto:drashadobe@gmail.com?subject=" + urllib.parse.quote(subject) + "&body=" + urllib.parse.quote(body)
+            st.markdown(f"[Open Email Client]({mailto})")
 
-    const mailtoLink = `mailto:drashadobe@gmail.com?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body.trim())}`;
-    
-    // Using window.open to avoid navigating away from the page
-    window.open(mailtoLink, '_blank');
+        else:
+            st.info("Summary will be generated when session ends.")
 
-  }, [userDetails, summaryText, rubric, transcript]);
-
-
-  if (isCheckingForSession) {
-    return (
-        <div className="fixed inset-0 bg-gray-900 flex items-center justify-center z-50">
-            <p className="text-slate-400">Loading...</p>
-        </div>
-    );
-  }
-
-  if (savedSessionData) {
-    return <ResumeDialog onResume={handleResumeSession} onStartNew={handleStartNewSessionFresh} />;
-  }
-
-  if (!isUserDetailsSubmitted) {
-    return <WelcomeForm onSubmit={handleUserDetailsSubmit} />;
-  }
-
-  return (
-    <main className="container mx-auto p-4 h-screen max-h-screen grid grid-rows-[auto,1fr] gap-4">
-      <header className="flex justify-between items-center">
-        <div className="flex items-center gap-4">
-          <div>
-            <h1 className="text-2xl font-bold text-slate-100">OSCE Live Skill Review</h1>
-            <p className="text-slate-400">Your personal AI-powered clinical skills examiner.</p>
-          </div>
-          <Timer
-            sessionStatus={sessionStatus}
-            startTime={sessionStartTime}
-            duration={sessionDuration}
-            onTimeUp={handleTimeUp}
-          />
-        </div>
-        <div className="flex items-center gap-4">
-            {sessionStatus === SessionStatus.ENDED && summaryText && (
-              <button
-                onClick={() => setShowEmailDialog(true)}
-                className="px-6 py-2 rounded-md font-semibold text-white transition-all shadow-lg bg-emerald-600 hover:bg-emerald-700 flex items-center gap-2"
-                title="Open in your default email client"
-              >
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-                  <path d="M2.003 5.884L10 9.882l7.997-3.998A2 2 0 0016 4H4a2 2 0 00-1.997 1.884z" />
-                  <path d="M18 8.118l-8 4-8-4V14a2 2 0 002 2h12a2 2 0 002-2V8.118z" />
-                </svg>
-                Email Report
-              </button>
-            )}
-            <button
-              onClick={handleMainButtonClick}
-              disabled={sessionStatus === SessionStatus.CONNECTING}
-              className={`px-6 py-2 rounded-md font-semibold text-white transition-all shadow-lg ${
-                sessionStatus === SessionStatus.LIVE
-                  ? 'bg-red-600 hover:bg-red-700'
-                  : 'bg-violet-600 hover:bg-violet-700'
-              } disabled:bg-slate-500 disabled:cursor-not-allowed`}
-            >
-              {sessionStatus === SessionStatus.CONNECTING && 'Starting...'}
-              {sessionStatus === SessionStatus.LIVE && 'End Session'}
-              {(sessionStatus === SessionStatus.IDLE || sessionStatus === SessionStatus.ENDED || sessionStatus === SessionStatus.ERROR) && 'Start New Session'}
-            </button>
-        </div>
-      </header>
-      <div className="grid grid-cols-5 gap-4 h-full overflow-hidden">
-        <div className="col-span-3 h-full">
-            {(sessionStatus === SessionStatus.LIVE || sessionStatus === SessionStatus.CONNECTING) ? (
-              <VideoPlayer ref={videoRef} canvasRef={canvasRef} />
-            ) : (
-              <InstructionsPanel />
-            )}
-        </div>
-        <div className="col-span-2 h-full grid grid-rows-2 gap-4">
-            <RubricPanel
-              rubric={rubric}
-              onUpdateRubric={handleUpdateRubric}
-              suggestedUpdate={suggestedUpdate}
-              onConfirmSuggestion={() => handleSuggestion(true, suggestedUpdate)}
-              onRejectSuggestion={() => handleSuggestion(false, suggestedUpdate)}
-            />
-            <FeedbackPanel transcript={transcript} status={sessionStatus} />
-        </div>
-      </div>
-      <ConfirmationDialog
-        isOpen={showConfirmation}
-        onConfirm={handleConfirmEndSession}
-        onCancel={() => setShowConfirmation(false)}
-        title="End Session?"
-        message="Are you sure you want to end the current OSCE session? This action cannot be undone."
-        confirmButtonText="End Session"
-        confirmButtonVariant="destructive"
-      />
-      <ConfirmationDialog
-        isOpen={showEmailDialog}
-        onConfirm={handleConfirmSendEmail}
-        onCancel={() => setShowEmailDialog(false)}
-        title="Prepare Email Report"
-        message="This will open your default email application (like Outlook or Gmail) with the report pre-filled. Do you want to continue?"
-        confirmButtonText="Yes, Open Email Client"
-        confirmButtonVariant="primary"
-      />
-    </main>
-  );
-};
-
-export default App;
+    st.markdown("---")
+    # Footer actions
+    cols = st.columns(3)
+    if cols[0].button("Save session to local JSON"):
+        dump = {
+            "user_details": asdict(st.session_state.user_details),
+            "rubric": [asdict(r) for r in st.session_state.rubric],
+            "transcript": [asdict(t) for t in st.session_state.transcript],
+            "summary": st.session_state.summary_text,
+        }
+        st.download_button("Download session JSON", data=save_session_to_bytes(dump), file_name="osce_session.json")
+    if cols[1].button("Clear transcript & rubric"):
+        st.session_state.transcript = []
+        st.session_state.rubric = [RubricItem(**asdict(i)) for i in INITIAL_RUBRIC]
+        st.session_state.summary_text = None
+        st.success("Cleared.")
+    if cols[2].button("Mark all pending as not met"):
+        for r in st.session_state.rubric:
+            if r.status == RubricStatus.PENDING:
+                r.status = RubricStatus.NOT_MET
+        st.success("Updated pending items.")
